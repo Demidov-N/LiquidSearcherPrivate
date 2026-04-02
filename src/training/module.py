@@ -11,7 +11,6 @@ from src.models.dual_encoder import DualEncoder
 
 
 class DualEncoderModule(pl.LightningModule):
-
     def __init__(
         self,
         temporal_input_dim: int = 13,
@@ -40,41 +39,35 @@ class DualEncoderModule(pl.LightningModule):
     def encode(self, batch: Dict[str, torch.Tensor]):
         """Return L2-normalised (temporal_emb, tabular_emb)."""
         temporal_emb = self.model.temporal_encoder(batch["temporal"])
-        tabular_emb  = self.model.tabular_encoder(
-            batch["tabular_cont"], batch["tabular_cat"]
-        )
+        tabular_emb = self.model.tabular_encoder(batch["tabular_cont"], batch["tabular_cat"])
         temporal_emb = F.normalize(temporal_emb, dim=-1)
-        tabular_emb  = F.normalize(tabular_emb,  dim=-1)
+        tabular_emb = F.normalize(tabular_emb, dim=-1)
         return temporal_emb, tabular_emb
 
     def _info_nce(
         self,
         temporal_emb: torch.Tensor,
-        tabular_emb:  torch.Tensor,
-        symbols:      List[str],
+        tabular_emb: torch.Tensor,
+        symbols: List[str],
     ) -> tuple[torch.Tensor, dict]:
-        B   = len(symbols)
+        B = len(symbols)
         tau = self.hparams.temperature
 
         sim = torch.matmul(temporal_emb, tabular_emb.t()) / tau  # (B, B)
 
         # False-negative mask — stays on GPU, no numpy round-trip
-        sym_tensor = torch.tensor(
-            [hash(s) for s in symbols], device=sim.device
-        )
-        same_sym  = sym_tensor[:, None] == sym_tensor[None, :]   # (B, B)
-        eye       = torch.eye(B, dtype=torch.bool, device=sim.device)
+        sym_tensor = torch.tensor([hash(s) for s in symbols], device=sim.device)
+        same_sym = sym_tensor[:, None] == sym_tensor[None, :]  # (B, B)
+        eye = torch.eye(B, dtype=torch.bool, device=sim.device)
         false_neg = same_sym & ~eye
 
         sim_masked = sim.clone()
-        sim_masked[false_neg] = -1e9
+        mask_value = torch.finfo(sim_masked.dtype).min
+        sim_masked = sim_masked.masked_fill(false_neg, mask_value)
 
         labels = torch.arange(B, device=sim.device)
 
-        loss = (
-            F.cross_entropy(sim_masked,    labels) +
-            F.cross_entropy(sim_masked.t(), labels)
-        ) / 2
+        loss = (F.cross_entropy(sim_masked, labels) + F.cross_entropy(sim_masked.t(), labels)) / 2
 
         with torch.no_grad():
             pos_sim = sim.diagonal().mean().item()
@@ -87,19 +80,19 @@ class DualEncoderModule(pl.LightningModule):
         temporal_emb, tabular_emb = self.encode(batch)
         loss, metrics = self._info_nce(temporal_emb, tabular_emb, batch["symbol"])
 
-        self.log("train/loss",      loss,                  on_step=True,  on_epoch=True, prog_bar=True)
-        self.log("train/alignment", metrics["alignment"],  on_step=False, on_epoch=True)
-        self.log("train/neg_sim",   metrics["neg_sim"],    on_step=False, on_epoch=True)
-        self.log("train/fn_frac",   metrics["fn_frac"],    on_step=False, on_epoch=True)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/alignment", metrics["alignment"], on_step=False, on_epoch=True)
+        self.log("train/neg_sim", metrics["neg_sim"], on_step=False, on_epoch=True)
+        self.log("train/fn_frac", metrics["fn_frac"], on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
         temporal_emb, tabular_emb = self.encode(batch)
         loss, metrics = self._info_nce(temporal_emb, tabular_emb, batch["symbol"])
 
-        self.log("val/loss",      loss,                  on_step=False, on_epoch=True, prog_bar=True)
-        self.log("val/alignment", metrics["alignment"],  on_step=False, on_epoch=True)
-        self.log("val/neg_sim",   metrics["neg_sim"],    on_step=False, on_epoch=True)
+        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val/alignment", metrics["alignment"], on_step=False, on_epoch=True)
+        self.log("val/neg_sim", metrics["neg_sim"], on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(self):
@@ -110,7 +103,7 @@ class DualEncoderModule(pl.LightningModule):
         )
 
         warmup = self.hparams.warmup_epochs
-        total  = self.hparams.max_epochs
+        total = self.hparams.max_epochs
 
         def lr_lambda(epoch: int) -> float:
             if epoch < warmup:

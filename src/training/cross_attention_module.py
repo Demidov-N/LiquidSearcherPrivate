@@ -139,7 +139,8 @@ class CrossAttentionDualEncoderModule(pl.LightningModule):
         false_neg = same_sym & ~eye
 
         sim_masked = sim.clone()
-        sim_masked[false_neg] = -1e9
+        mask_value = torch.finfo(sim_masked.dtype).min
+        sim_masked = sim_masked.masked_fill(false_neg, mask_value)
 
         labels = torch.arange(B, device=sim.device)
 
