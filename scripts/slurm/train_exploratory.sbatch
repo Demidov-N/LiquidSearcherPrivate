@@ -23,7 +23,6 @@ echo "Python: $PYTHON_BIN"
 "$PYTHON_BIN" --version
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 
-# Avoid Lightning picking up partial interactive Slurm state when launched from OOD/VSCode.
 unset SLURM_NTASKS SLURM_PROCID SLURM_LOCALID
 
 "$PYTHON_BIN" -m scripts.train_cross_attention_rtx5000 \
