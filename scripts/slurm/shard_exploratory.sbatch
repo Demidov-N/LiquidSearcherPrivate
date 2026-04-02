@@ -9,18 +9,19 @@
 
 set -euo pipefail
 
-cd ~/LiquidSearcherPrivate
+PROJECT_ROOT="${PROJECT_ROOT:-/users/mvillal4/scratch/liquid/LiquidSearcherPrivate}"
+PYTHON_BIN="${PYTHON_BIN:-/users/mvillal4/.pyenv/versions/3.11.9/bin/python}"
+
+cd "$PROJECT_ROOT"
 mkdir -p logs data/processed/features
 
-# Prefer project venv, otherwise use the active python (for pyenv-based setups).
-if [[ -d ".venv" ]]; then
-    source .venv/bin/activate
-fi
+export PYTHONUNBUFFERED=1
 
-echo "Python: $(which python)"
-python --version
+echo "Project root: $PROJECT_ROOT"
+echo "Python: $PYTHON_BIN"
+"$PYTHON_BIN" --version
 
-POLARS_MAX_THREADS=1 PYARROW_NUM_THREADS=1 python -m scripts.shard_by_symbol \
+POLARS_MAX_THREADS=1 PYARROW_NUM_THREADS=1 "$PYTHON_BIN" -m scripts.shard_by_symbol \
     --src data/processed/all_features.parquet \
     --out data/processed/features \
     --resume \
