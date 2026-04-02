@@ -9,6 +9,18 @@
 
 set -euo pipefail
 
+cd ~/LiquidSearcherPrivate
+mkdir -p logs data/processed/features
+
+# Prefer project venv, otherwise use the active python (for pyenv-based setups).
+if [[ -d ".venv" ]]; then
+    source .venv/bin/activate
+fi
+
+echo "Python: $(which python)"
+python --version
+
+POLARS_MAX_THREADS=1 PYARROW_NUM_THREADS=1 python -m scripts.shard_by_symbol \
 PROJECT_ROOT="${PROJECT_ROOT:-/users/mvillal4/scratch/liquid/LiquidSearcherPrivate}"
 PYTHON_BIN="${PYTHON_BIN:-/users/mvillal4/.pyenv/versions/3.11.9/bin/python}"
 

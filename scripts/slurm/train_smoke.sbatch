@@ -10,6 +10,16 @@
 
 set -euo pipefail
 
+cd ~/LiquidSearcherPrivate
+mkdir -p logs checkpoints_cross_smoke
+
+# Prefer project venv, otherwise use the active python (for pyenv-based setups).
+if [[ -d ".venv" ]]; then
+    source .venv/bin/activate
+fi
+
+echo "Python: $(which python)"
+python --version
 PROJECT_ROOT="${PROJECT_ROOT:-/users/mvillal4/scratch/liquid/LiquidSearcherPrivate}"
 PYTHON_BIN="${PYTHON_BIN:-/users/mvillal4/.pyenv/versions/3.11.9/bin/python}"
 
@@ -25,6 +35,7 @@ echo "Python: $PYTHON_BIN"
 # Avoid Lightning picking up partial interactive Slurm state.
 unset SLURM_NTASKS SLURM_PROCID SLURM_LOCALID
 
+python -m scripts.train_cross_attention_rtx5000 \
 "$PYTHON_BIN" -m scripts.train_cross_attention_rtx5000 \
     --feature-dir data/processed/all_features.parquet \
     --epochs 1 \
