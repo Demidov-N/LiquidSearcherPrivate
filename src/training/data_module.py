@@ -1,6 +1,7 @@
 """PyTorch Lightning DataModule with temporal splits for financial data."""
 
 import torch
+
 torch.set_float32_matmul_precision("medium")  # utilise Tensor Cores on RTX/A-series GPUs
 
 from datetime import timedelta
@@ -12,38 +13,56 @@ import pandas as pd
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
 
-pd.set_option('future.no_silent_downcasting', True)
+pd.set_option("future.no_silent_downcasting", True)
 
 TEMPORAL_FEATURE_NAMES = [
-    "z_close", "z_volume", "ma_ratio_5d", "ma_ratio_10d", "ma_ratio_20d",
-    "realized_vol_20d", "realized_vol_60d", "mom_1m", "mom_3m", "mom_6m",
-    "mom_12m", "mom_12_1m", "log_ret_cum",
+    "z_close",
+    "z_volume",
+    "ma_ratio_5d",
+    "ma_ratio_10d",
+    "ma_ratio_20d",
+    "realized_vol_20d",
+    "realized_vol_60d",
+    "mom_1m",
+    "mom_3m",
+    "mom_6m",
+    "mom_12m",
+    "mom_12_1m",
+    "log_ret_cum",
 ]  # 13 features
 
 TABULAR_CONTINUOUS_NAMES = [
-    "beta",              # 0:  from CRSP vwretd local OLS
-    "idiosyncratic_vol", # 1:  from CRSP vwretd local OLS
-    "roe",               # 2:  wrds_ratios.roe
-    "roa",               # 3:  wrds_ratios.roa
-    "debt_to_equity",    # 4:  wrds_ratios.de_ratio
-    "price_to_book",     # 5:  wrds_ratios.ptb
-    "price_to_earnings", # 6:  wrds_ratios.pe_op_dil
-    "market_cap",        # 7:  wrds_ratios.mktcap
-    "dividend_yield",    # 8:  wrds_ratios.divyield
-    "revenue",           # 9:  wrds_ratios.at_turn (asset turnover proxy)
-    "net_income",        # 10: NaN placeholder (not in wrds_ratios)
-    "total_assets",      # 11: NaN placeholder (not in wrds_ratios)
-    "cash",              # 12: NaN placeholder (not in wrds_ratios)
+    "beta",  # 0:  from CRSP vwretd local OLS
+    "idiosyncratic_vol",  # 1:  from CRSP vwretd local OLS
+    "roe",  # 2:  wrds_ratios.roe
+    "roa",  # 3:  wrds_ratios.roa
+    "debt_to_equity",  # 4:  wrds_ratios.de_ratio
+    "price_to_book",  # 5:  wrds_ratios.ptb
+    "price_to_earnings",  # 6:  wrds_ratios.pe_op_dil
+    "market_cap",  # 7:  wrds_ratios.mktcap
+    "dividend_yield",  # 8:  wrds_ratios.divyield
+    "revenue",  # 9:  wrds_ratios.at_turn (asset turnover proxy)
+    "net_income",  # 10: NaN placeholder (not in wrds_ratios)
+    "total_assets",  # 11: NaN placeholder (not in wrds_ratios)
+    "cash",  # 12: NaN placeholder (not in wrds_ratios)
     "operating_margin",  # 13: wrds_ratios.opmad
-    "profit_margin",     # 14: wrds_ratios.npm
+    "profit_margin",  # 14: wrds_ratios.npm
 ]  # 15 features
 
 # Raw Compustat columns — may or may not exist in the parquet depending
 # on whether fundamentals were successfully fetched during preprocessing.
 # _load_symbol reads only what is present and fills the rest with NaN.
 _FUNDAMENTAL_RAW_COLS = [
-    "atq", "seqq", "niq", "cshoq", "ceqq",
-    "epspxq", "txtq", "xintq", "saleq", "cheq",
+    "atq",
+    "seqq",
+    "niq",
+    "cshoq",
+    "ceqq",
+    "epspxq",
+    "txtq",
+    "xintq",
+    "saleq",
+    "cheq",
 ]
 
 # Always-present columns (price features + technicals + beta + sector)
@@ -71,22 +90,40 @@ LRU_CACHE_SIZE = 128
 _DF_CACHE: OrderedDict = OrderedDict()
 
 
-def _load_symbol(file_path: str) -> pd.DataFrame:
-    if file_path in _DF_CACHE:
-        _DF_CACHE.move_to_end(file_path)
-        return _DF_CACHE[file_path]
+def _load_symbol(file_path: str, symbol: Optional[str] = None) -> pd.DataFrame:
+    """
+    Load a symbol DataFrame from either a sharded file or a single-file mode.
+
+    Args:
+        file_path: path to the parquet file
+        symbol: if provided, filter this symbol from the shared parquet (file-mode)
+               if None, treat as directory mode (each file is one symbol)
+    """
+    cache_key = (file_path, symbol) if symbol else file_path
+
+    if cache_key in _DF_CACHE:
+        _DF_CACHE.move_to_end(cache_key)
+        return _DF_CACHE[cache_key]
 
     # Read only columns that actually exist in this parquet file
     import pyarrow.parquet as pq
+
     available = set(pq.read_schema(file_path).names)
     cols_to_read = [c for c in _NEEDED_COLS if c in available]
     df = pd.read_parquet(file_path, columns=cols_to_read)
+
+    # File-mode: filter to specific symbol
+    if symbol is not None:
+        df = df[df["symbol"] == symbol].copy()
+        if len(df) == 0:
+            raise ValueError(f"No rows found for symbol {symbol} in {file_path}")
+
     df["date"] = pd.to_datetime(df["date"])
     df.sort_values("date", inplace=True)
     df.reset_index(drop=True, inplace=True)
     # gsector/ggroup exist now — fill before ratio derivation
     df["gsector"] = df["gsector"].fillna(0).astype(int) if "gsector" in df.columns else 0
-    df["ggroup"]  = df["ggroup"].fillna(0).astype(int)  if "ggroup"  in df.columns else 0
+    df["ggroup"] = df["ggroup"].fillna(0).astype(int) if "ggroup" in df.columns else 0
     # TABULAR_CONTINUOUS_NAMES filled AFTER ratio derivation below
 
     # Derive fundamental ratios if raw Compustat columns are present.
@@ -99,38 +136,42 @@ def _load_symbol(file_path: str) -> pd.DataFrame:
 
     nan_col = pd.Series(float("nan"), index=df.index)
 
-    df["roe"]               = (_safe_div(df["niq"],  df["ceqq"]).clip(-100, 100)
-                                if has_fundamentals else nan_col)
-    df["roa"]               = (_safe_div(df["niq"],  df["atq"]).clip(-100, 100)
-                                if has_fundamentals else nan_col)
-    df["debt_to_equity"]    = (_safe_div(df["atq"] - df["seqq"], df["seqq"]).clip(-100, 100)
-                                if has_fundamentals else nan_col)
-    df["price_to_book"]     = (_safe_div(df["prc"], _safe_div(df["ceqq"], df["cshoq"])).clip(-100, 100)
-                                if has_fundamentals else nan_col)
-    df["price_to_earnings"] = (_safe_div(df["prc"], df["epspxq"]).clip(-100, 100)
-                                if has_fundamentals else nan_col)
-    df["market_cap"]        = (df["prc"] * df["cshoq"] if has_fundamentals else nan_col)
-    df["net_income"]        = (df["niq"]  if has_fundamentals else nan_col)
-    df["total_assets"]      = (df["atq"]  if has_fundamentals else nan_col)
-    df["revenue"]           = (df["saleq"] if "saleq" in df.columns else nan_col)
-    df["cash"]              = (df["cheq"]  if "cheq"  in df.columns else nan_col)
+    df["roe"] = _safe_div(df["niq"], df["ceqq"]).clip(-100, 100) if has_fundamentals else nan_col
+    df["roa"] = _safe_div(df["niq"], df["atq"]).clip(-100, 100) if has_fundamentals else nan_col
+    df["debt_to_equity"] = (
+        _safe_div(df["atq"] - df["seqq"], df["seqq"]).clip(-100, 100)
+        if has_fundamentals
+        else nan_col
+    )
+    df["price_to_book"] = (
+        _safe_div(df["prc"], _safe_div(df["ceqq"], df["cshoq"])).clip(-100, 100)
+        if has_fundamentals
+        else nan_col
+    )
+    df["price_to_earnings"] = (
+        _safe_div(df["prc"], df["epspxq"]).clip(-100, 100) if has_fundamentals else nan_col
+    )
+    df["market_cap"] = df["prc"] * df["cshoq"] if has_fundamentals else nan_col
+    df["net_income"] = df["niq"] if has_fundamentals else nan_col
+    df["total_assets"] = df["atq"] if has_fundamentals else nan_col
+    df["revenue"] = df["saleq"] if "saleq" in df.columns else nan_col
+    df["cash"] = df["cheq"] if "cheq" in df.columns else nan_col
 
     if has_fundamentals:
-        ebit = (df["niq"]
-                + df.get("txtq",  nan_col).fillna(0)
-                + df.get("xintq", nan_col).fillna(0))
+        ebit = df["niq"] + df.get("txtq", nan_col).fillna(0) + df.get("xintq", nan_col).fillna(0)
         sale = df.get("saleq", nan_col)
         df["operating_margin"] = _safe_div(ebit, sale)
-        df["profit_margin"]    = _safe_div(df["niq"], sale)
+        df["profit_margin"] = _safe_div(df["niq"], sale)
     else:
         df["operating_margin"] = nan_col
-        df["profit_margin"]    = nan_col
+        df["profit_margin"] = nan_col
 
     df["dividend_yield"] = 0.0
 
     # Drop raw columns — not needed downstream
-    df.drop(columns=[c for c in _FUNDAMENTAL_RAW_COLS if c in df.columns],
-            inplace=True, errors="ignore")
+    df.drop(
+        columns=[c for c in _FUNDAMENTAL_RAW_COLS if c in df.columns], inplace=True, errors="ignore"
+    )
 
     # Now all TABULAR_CONTINUOUS_NAMES columns exist (either derived or NaN)
     # Fill NaN → 0 so __getitem__ never receives NaN into the model
@@ -140,24 +181,26 @@ def _load_symbol(file_path: str) -> pd.DataFrame:
         else:
             df[col] = df[col].fillna(0.0)
 
-    _DF_CACHE[file_path] = df
+    _DF_CACHE[cache_key] = df
     if len(_DF_CACHE) > LRU_CACHE_SIZE:
         _DF_CACHE.popitem(last=False)
 
-    return _DF_CACHE[file_path]
+    return _DF_CACHE[cache_key]
 
 
 # ---------------------------------------------------------------------------
 # Compact index
 # ---------------------------------------------------------------------------
 
+
 class _SymbolEntry:
     """Holds all valid end-row indices for one symbol. ~8 bytes × N rows."""
+
     __slots__ = ("symbol", "file_path", "row_indices")
 
     def __init__(self, symbol: str, file_path: str, row_indices: np.ndarray):
-        self.symbol      = symbol
-        self.file_path   = file_path
+        self.symbol = symbol
+        self.file_path = file_path
         self.row_indices = row_indices
 
 
@@ -165,30 +208,85 @@ class _SymbolEntry:
 # Dataset
 # ---------------------------------------------------------------------------
 
-class StockDataset(Dataset):
 
+class StockDataset(Dataset):
     GSECTOR_MAX = 10
-    GGROUP_MAX  = 24
+    GGROUP_MAX = 24
 
     def __init__(
         self,
         feature_dir: str,
-        date_range:  tuple[str, str],
-        symbols:     Optional[List[str]] = None,
+        date_range: tuple[str, str],
+        symbols: Optional[List[str]] = None,
         window_size: int = 60,
     ):
         self.feature_dir = Path(feature_dir)
         self.window_size = window_size
-        self.start_date  = pd.Timestamp(date_range[0])
-        self.end_date    = pd.Timestamp(date_range[1])
-        self._symbols    = symbols or self._discover_symbols()
+        self.start_date = pd.Timestamp(date_range[0])
+        self.end_date = pd.Timestamp(date_range[1])
+
+        # Detect mode: file or directory
+        self._is_file_mode = self.feature_dir.is_file()
+
+        # Validate path exists
+        if not self.feature_dir.exists():
+            raise FileNotFoundError(f"Path does not exist: {self.feature_dir}")
+
+        # Validate required schema for file-mode and discover all symbols
+        all_symbols = self._discover_all_symbols()
+
+        # Use requested symbols or default to all discovered
+        self._symbols = symbols or all_symbols
+
+        # Warn about missing requested symbols
+        if symbols:
+            missing = set(symbols) - set(all_symbols)
+            if missing:
+                print(f"Warning: requested symbols not found in data: {missing}")
+                # Filter to only symbols that exist
+                self._symbols = [s for s in symbols if s in all_symbols]
+
+        if not self._symbols:
+            raise ValueError(f"No valid symbols found for requested list: {symbols}")
+
         self._entries, self._offsets = self._build_index()
 
-    def _discover_symbols(self) -> List[str]:
-        return sorted(
-            f.stem.replace("_features", "")
-            for f in self.feature_dir.glob("*_features.parquet")
-        )
+    def _discover_all_symbols(self) -> List[str]:
+        """Discover all symbols in the dataset (file or directory mode)."""
+        if self._is_file_mode:
+            # File mode: read symbol column from parquet
+            self._validate_file_schema()
+            df_symbols = pd.read_parquet(str(self.feature_dir), columns=["symbol"])
+            return sorted(df_symbols["symbol"].unique().tolist())
+        else:
+            # Directory mode: find *_features.parquet files
+            symbols = sorted(
+                f.stem.replace("_features", "") for f in self.feature_dir.glob("*_features.parquet")
+            )
+            if not symbols:
+                raise ValueError(f"No *_features.parquet files found in {self.feature_dir}")
+            return symbols
+
+    def _validate_file_schema(self) -> None:
+        """Validate required columns exist in file-mode parquet."""
+        if not self._is_file_mode:
+            return
+
+        import pyarrow.parquet as pq
+
+        schema = pq.read_schema(str(self.feature_dir))
+        available_cols = set(schema.names)
+
+        # Check for required base columns
+        required_cols = set(_BASE_COLS) - {"date", "symbol"}  # These are always needed
+        required_cols.update(["date", "symbol"])
+
+        missing = required_cols - available_cols
+        if missing:
+            raise ValueError(
+                f"Missing required columns in parquet file: {sorted(missing)}\n"
+                f"Available columns: {sorted(available_cols)}"
+            )
 
     def _build_index(self):
         """
@@ -199,25 +297,43 @@ class StockDataset(Dataset):
         offsets = [0]
 
         for sym in self._symbols:
-            fp = self.feature_dir / f"{sym}_features.parquet"
-            if not fp.exists():
-                continue
             try:
-                dates = (
-                    pd.read_parquet(fp, columns=["date"])
-                      .assign(date=lambda d: pd.to_datetime(d["date"]))
-                      .sort_values("date")
-                      .reset_index(drop=True)
-                )
-                mask = (
-                    (dates["date"] >= self.start_date) &
-                    (dates["date"] <= self.end_date)
-                )
+                if self._is_file_mode:
+                    # File mode: read and filter from shared parquet
+                    dates = (
+                        pd.read_parquet(str(self.feature_dir), columns=["date", "symbol"])
+                        .query(f'symbol == "{sym}"')
+                        .assign(date=lambda d: pd.to_datetime(d["date"]))
+                        .sort_values("date")
+                        .reset_index(drop=True)
+                    )
+                else:
+                    # Directory mode: read from individual symbol file
+                    fp = self.feature_dir / f"{sym}_features.parquet"
+                    if not fp.exists():
+                        continue
+                    dates = (
+                        pd.read_parquet(fp, columns=["date"])
+                        .assign(date=lambda d: pd.to_datetime(d["date"]))
+                        .sort_values("date")
+                        .reset_index(drop=True)
+                    )
+
+                mask = (dates["date"] >= self.start_date) & (dates["date"] <= self.end_date)
                 rows = np.where(mask.values)[0]
+
                 if len(rows) == 0:
                     continue
-                entries.append(_SymbolEntry(sym, str(fp), rows))
+
+                # File path for caching
+                fp = (
+                    str(self.feature_dir)
+                    if self._is_file_mode
+                    else str(self.feature_dir / f"{sym}_features.parquet")
+                )
+                entries.append(_SymbolEntry(sym, fp, rows))
                 offsets.append(offsets[-1] + len(rows))
+
             except Exception as exc:
                 print(f"Warning: skipping {sym}: {exc}")
 
@@ -228,21 +344,25 @@ class StockDataset(Dataset):
 
     def _locate(self, idx: int):
         """O(log N) flat-index → (entry, end_row)."""
-        ei      = int(np.searchsorted(self._offsets, idx, side="right")) - 1
-        entry   = self._entries[ei]
+        ei = int(np.searchsorted(self._offsets, idx, side="right")) - 1
+        entry = self._entries[ei]
         end_row = int(entry.row_indices[idx - int(self._offsets[ei])])
         return entry, end_row
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         entry, end_row = self._locate(idx)
 
-        df = _load_symbol(entry.file_path)   # cache hit after first access
+        # Load symbol data, passing symbol for file-mode filtering
+        if self._is_file_mode:
+            df = _load_symbol(entry.file_path, symbol=entry.symbol)
+        else:
+            df = _load_symbol(entry.file_path)
 
         # Temporal window
-        start_row    = max(0, end_row - self.window_size + 1)
-        window       = df.iloc[start_row : end_row + 1]
-        temporal_np  = window[TEMPORAL_FEATURE_NAMES].to_numpy(dtype=np.float32)
-        temporal_np  = np.nan_to_num(temporal_np, nan=0.0, posinf=0.0, neginf=0.0)
+        start_row = max(0, end_row - self.window_size + 1)
+        window = df.iloc[start_row : end_row + 1]
+        temporal_np = window[TEMPORAL_FEATURE_NAMES].to_numpy(dtype=np.float32)
+        temporal_np = np.nan_to_num(temporal_np, nan=0.0, posinf=0.0, neginf=0.0)
 
         if len(window) < self.window_size:
             pad = self.window_size - len(window)
@@ -251,21 +371,21 @@ class StockDataset(Dataset):
             temporal_np = buf
 
         # Tabular snapshot
-        row          = df.iloc[end_row]
+        row = df.iloc[end_row]
         tabular_cont = row[TABULAR_CONTINUOUS_NAMES].to_numpy(dtype=np.float32)
         tabular_cont = np.nan_to_num(tabular_cont, nan=0.0, posinf=0.0, neginf=0.0)
-        gsector      = int(np.clip(row["gsector"], 0, self.GSECTOR_MAX))
-        ggroup       = int(np.clip(row["ggroup"],  0, self.GGROUP_MAX))
+        gsector = int(np.clip(row["gsector"], 0, self.GSECTOR_MAX))
+        ggroup = int(np.clip(row["ggroup"], 0, self.GGROUP_MAX))
 
         return {
-            "symbol":       entry.symbol,
-            "date":         str(row["date"].date()),
-            "temporal":     torch.from_numpy(temporal_np),
+            "symbol": entry.symbol,
+            "date": str(row["date"].date()),
+            "temporal": torch.from_numpy(temporal_np),
             "tabular_cont": torch.from_numpy(tabular_cont),
-            "tabular_cat":  torch.tensor([gsector, ggroup], dtype=torch.long),
-            "beta":         float(tabular_cont[0]),
-            "gsector":      gsector,
-            "ggroup":       ggroup,
+            "tabular_cat": torch.tensor([gsector, ggroup], dtype=torch.long),
+            "beta": float(tabular_cont[0]),
+            "gsector": gsector,
+            "ggroup": ggroup,
         }
 
 
@@ -273,57 +393,56 @@ class StockDataset(Dataset):
 # DataModule
 # ---------------------------------------------------------------------------
 
-class StockDataModule(pl.LightningDataModule):
 
+class StockDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        feature_dir:   str,
-        train_start:   str,
-        train_end:     str,
-        val_start:     str,
-        val_end:       str,
-        test_start:    Optional[str] = None,
-        test_end:      Optional[str] = None,
-        symbols:       Optional[List[str]] = None,
-        batch_size:    int = 32,
-        num_workers:   int = 4,
-        purge_days:    int = 252,
-        embargo_days:  int = 63,
-        window_size:   int = 60,
-        samples_per_epoch: Optional[bool] = None
-
+        feature_dir: str,
+        train_start: str,
+        train_end: str,
+        val_start: str,
+        val_end: str,
+        test_start: Optional[str] = None,
+        test_end: Optional[str] = None,
+        symbols: Optional[List[str]] = None,
+        batch_size: int = 32,
+        num_workers: int = 4,
+        pin_memory: bool = True,
+        purge_days: int = 252,
+        embargo_days: int = 63,
+        window_size: int = 60,
+        samples_per_epoch: Optional[bool] = None,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.feature_dir = feature_dir
-        self.batch_size  = batch_size
+        self.batch_size = batch_size
         self.num_workers = num_workers
+        self.pin_memory = pin_memory
         self.window_size = window_size
-        self.symbols     = symbols
+        self.symbols = symbols
 
         self.train_start = pd.Timestamp(train_start)
-        self.train_end   = pd.Timestamp(train_end)
-        self.val_start   = pd.Timestamp(val_start)
-        self.val_end     = pd.Timestamp(val_end)
+        self.train_end = pd.Timestamp(train_end)
+        self.val_start = pd.Timestamp(val_start)
+        self.val_end = pd.Timestamp(val_end)
 
-        self.effective_train_end  = self.train_end  - timedelta(days=purge_days)
-        self.effective_val_start  = self.val_start  + timedelta(days=embargo_days)
+        self.effective_train_end = self.train_end - timedelta(days=purge_days)
+        self.effective_val_start = self.val_start + timedelta(days=embargo_days)
 
     def setup(self, stage: Optional[str] = None):
         if stage in ("fit", None):
             self.train_dataset = StockDataset(
-                feature_dir = self.feature_dir,
-                date_range  = (str(self.train_start.date()),
-                               str(self.effective_train_end.date())),
-                symbols     = self.symbols,
-                window_size = self.window_size,
+                feature_dir=self.feature_dir,
+                date_range=(str(self.train_start.date()), str(self.effective_train_end.date())),
+                symbols=self.symbols,
+                window_size=self.window_size,
             )
             self.val_dataset = StockDataset(
-                feature_dir = self.feature_dir,
-                date_range  = (str(self.effective_val_start.date()),
-                               str(self.val_end.date())),
-                symbols     = self.symbols,
-                window_size = self.window_size,
+                feature_dir=self.feature_dir,
+                date_range=(str(self.effective_val_start.date()), str(self.val_end.date())),
+                symbols=self.symbols,
+                window_size=self.window_size,
             )
             print(f"Train: {len(self.train_dataset):,} samples")
             print(f"Val:   {len(self.val_dataset):,} samples")
@@ -335,14 +454,14 @@ class StockDataModule(pl.LightningDataModule):
         # ahead — keeps the GPU fed without excessive RAM pressure.
         return DataLoader(
             dataset,
-            batch_size             = self.batch_size,
-            shuffle                = shuffle,
-            num_workers            = self.num_workers,
-            pin_memory             = True,
-            drop_last              = shuffle,
-            persistent_workers     = self.num_workers > 0,
-            prefetch_factor        = 2 if self.num_workers > 0 else None,
-            multiprocessing_context= "fork" if self.num_workers > 0 else None,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            drop_last=shuffle,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
+            multiprocessing_context="fork" if self.num_workers > 0 else None,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -352,7 +471,6 @@ class StockDataModule(pl.LightningDataModule):
             indices = torch.randperm(len(dataset))[:n]
             dataset = torch.utils.data.Subset(dataset, indices)
         return self._loader(dataset, shuffle=True)
-
 
     def val_dataloader(self) -> DataLoader:
         return self._loader(self.val_dataset, shuffle=False)
