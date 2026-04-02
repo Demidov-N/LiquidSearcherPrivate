@@ -1,5 +1,8 @@
 """PyTorch Lightning DataModule with temporal splits for financial data."""
 
+import logging
+import warnings
+
 import torch
 
 torch.set_float32_matmul_precision("medium")  # utilise Tensor Cores on RTX/A-series GPUs
@@ -13,7 +16,14 @@ import pandas as pd
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm is expected but keep fallback cheap
+    tqdm = None
+
 pd.set_option("future.no_silent_downcasting", True)
+
+logger = logging.getLogger(__name__)
 
 TEMPORAL_FEATURE_NAMES = [
     "z_close",
@@ -232,6 +242,15 @@ class StockDataset(Dataset):
         if not self.feature_dir.exists():
             raise FileNotFoundError(f"Path does not exist: {self.feature_dir}")
 
+        logger.info(
+            "Initializing StockDataset: path=%s mode=%s date_range=%s..%s requested_symbols=%s",
+            self.feature_dir,
+            "file" if self._is_file_mode else "directory",
+            self.start_date.date(),
+            self.end_date.date(),
+            len(symbols) if symbols is not None else "all",
+        )
+
         # Validate required schema for file-mode and discover all symbols
         all_symbols = self._discover_all_symbols()
 
@@ -242,7 +261,10 @@ class StockDataset(Dataset):
         if symbols:
             missing = set(symbols) - set(all_symbols)
             if missing:
-                print(f"Warning: requested symbols not found in data: {missing}")
+                warnings.warn(
+                    f"requested symbols not found in data: {sorted(missing)}",
+                    stacklevel=2,
+                )
                 # Filter to only symbols that exist
                 self._symbols = [s for s in symbols if s in all_symbols]
 
@@ -255,16 +277,21 @@ class StockDataset(Dataset):
         """Discover all symbols in the dataset (file or directory mode)."""
         if self._is_file_mode:
             # File mode: read symbol column from parquet
+            logger.info("Discovering symbols from monolithic parquet: %s", self.feature_dir)
             self._validate_file_schema()
             df_symbols = pd.read_parquet(str(self.feature_dir), columns=["symbol"])
-            return sorted(df_symbols["symbol"].unique().tolist())
+            symbols = sorted(df_symbols["symbol"].unique().tolist())
+            logger.info("Discovered %s symbols from monolithic parquet", len(symbols))
+            return symbols
         else:
             # Directory mode: find *_features.parquet files
+            logger.info("Discovering symbols from sharded directory: %s", self.feature_dir)
             symbols = sorted(
                 f.stem.replace("_features", "") for f in self.feature_dir.glob("*_features.parquet")
             )
             if not symbols:
                 raise ValueError(f"No *_features.parquet files found in {self.feature_dir}")
+            logger.info("Discovered %s symbols from sharded directory", len(symbols))
             return symbols
 
     def _validate_file_schema(self) -> None:
@@ -296,28 +323,60 @@ class StockDataset(Dataset):
         entries: List[_SymbolEntry] = []
         offsets = [0]
 
-        for sym in self._symbols:
+        logger.info(
+            "Building dataset index for %s symbols (%s mode)",
+            len(self._symbols),
+            "file" if self._is_file_mode else "directory",
+        )
+
+        if self._is_file_mode:
+            logger.info("Index stage 1/3: reading [date, symbol] once from monolithic parquet")
+            dates = pd.read_parquet(str(self.feature_dir), columns=["date", "symbol"])
+            dates["date"] = pd.to_datetime(dates["date"])
+            dates = dates[dates["symbol"].isin(self._symbols)]
+            logger.info(
+                "Index stage 2/3: sorting and grouping %s rows across %s requested symbols",
+                len(dates),
+                len(self._symbols),
+            )
+            grouped = {
+                sym: grp.sort_values("date").reset_index(drop=True)
+                for sym, grp in dates.groupby("symbol", sort=True)
+            }
+            iterator = self._iter_symbols_with_progress(
+                self._symbols, desc="Indexing file-mode symbols"
+            )
+            for i, sym in iterator:
+                sym_dates = grouped.get(sym)
+                if sym_dates is None or sym_dates.empty:
+                    continue
+
+                mask = (sym_dates["date"] >= self.start_date) & (sym_dates["date"] <= self.end_date)
+                rows = np.where(mask.values)[0]
+                if len(rows) == 0:
+                    continue
+
+                entries.append(_SymbolEntry(sym, str(self.feature_dir), rows))
+                offsets.append(offsets[-1] + len(rows))
+
+                if i % 100 == 0 or i == len(self._symbols):
+                    logger.info("Indexed %s/%s symbols", i, len(self._symbols))
+
+            logger.info("Index stage 3/3: finalized %s symbol entries", len(entries))
+            return entries, np.array(offsets, dtype=np.int64)
+
+        iterator = self._iter_symbols_with_progress(self._symbols, desc="Indexing sharded symbols")
+        for i, sym in iterator:
             try:
-                if self._is_file_mode:
-                    # File mode: read and filter from shared parquet
-                    dates = (
-                        pd.read_parquet(str(self.feature_dir), columns=["date", "symbol"])
-                        .query(f'symbol == "{sym}"')
-                        .assign(date=lambda d: pd.to_datetime(d["date"]))
-                        .sort_values("date")
-                        .reset_index(drop=True)
-                    )
-                else:
-                    # Directory mode: read from individual symbol file
-                    fp = self.feature_dir / f"{sym}_features.parquet"
-                    if not fp.exists():
-                        continue
-                    dates = (
-                        pd.read_parquet(fp, columns=["date"])
-                        .assign(date=lambda d: pd.to_datetime(d["date"]))
-                        .sort_values("date")
-                        .reset_index(drop=True)
-                    )
+                fp = self.feature_dir / f"{sym}_features.parquet"
+                if not fp.exists():
+                    continue
+                dates = (
+                    pd.read_parquet(fp, columns=["date"])
+                    .assign(date=lambda d: pd.to_datetime(d["date"]))
+                    .sort_values("date")
+                    .reset_index(drop=True)
+                )
 
                 mask = (dates["date"] >= self.start_date) & (dates["date"] <= self.end_date)
                 rows = np.where(mask.values)[0]
@@ -325,19 +384,27 @@ class StockDataset(Dataset):
                 if len(rows) == 0:
                     continue
 
-                # File path for caching
-                fp = (
-                    str(self.feature_dir)
-                    if self._is_file_mode
-                    else str(self.feature_dir / f"{sym}_features.parquet")
-                )
-                entries.append(_SymbolEntry(sym, fp, rows))
+                entries.append(_SymbolEntry(sym, str(fp), rows))
                 offsets.append(offsets[-1] + len(rows))
 
-            except Exception as exc:
-                print(f"Warning: skipping {sym}: {exc}")
+                if i % 100 == 0 or i == len(self._symbols):
+                    logger.info("Indexed %s/%s symbols", i, len(self._symbols))
 
+            except Exception as exc:
+                warnings.warn(f"skipping {sym}: {exc}", stacklevel=2)
+
+        logger.info("Finished building dataset index with %s symbol entries", len(entries))
         return entries, np.array(offsets, dtype=np.int64)
+
+    def _iter_symbols_with_progress(self, symbols: List[str], desc: str):
+        total = len(symbols)
+        if tqdm is None:
+            for i, sym in enumerate(symbols, start=1):
+                yield i, sym
+            return
+
+        for i, sym in enumerate(tqdm(symbols, desc=desc, unit="symbol", leave=False), start=1):
+            yield i, sym
 
     def __len__(self) -> int:
         return int(self._offsets[-1])
@@ -432,18 +499,23 @@ class StockDataModule(pl.LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         if stage in ("fit", None):
+            logger.info("DataModule setup started for stage=%s", stage or "fit")
+            logger.info("Building train dataset...")
             self.train_dataset = StockDataset(
                 feature_dir=self.feature_dir,
                 date_range=(str(self.train_start.date()), str(self.effective_train_end.date())),
                 symbols=self.symbols,
                 window_size=self.window_size,
             )
+            logger.info("Train dataset built with %s samples", len(self.train_dataset))
+            logger.info("Building validation dataset...")
             self.val_dataset = StockDataset(
                 feature_dir=self.feature_dir,
                 date_range=(str(self.effective_val_start.date()), str(self.val_end.date())),
                 symbols=self.symbols,
                 window_size=self.window_size,
             )
+            logger.info("Validation dataset built with %s samples", len(self.val_dataset))
             print(f"Train: {len(self.train_dataset):,} samples")
             print(f"Val:   {len(self.val_dataset):,} samples")
 
