@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=liq-xattn
+#SBATCH --job-name=liq-resume
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=128G
 #SBATCH --time=47:59:00
-#SBATCH --output=logs/slurm-train-%j.out
-#SBATCH --error=logs/slurm-train-%j.err
+#SBATCH --output=logs/slurm-resume-%j.out
+#SBATCH --error=logs/slurm-resume-%j.err
 
 set -euo pipefail
 
@@ -23,13 +23,12 @@ echo "Python: $PYTHON_BIN"
 "$PYTHON_BIN" --version
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 
-# Avoid Lightning picking up partial interactive Slurm state when launched from OOD/VSCode.
 unset SLURM_NTASKS SLURM_PROCID SLURM_LOCALID
 
 "$PYTHON_BIN" -m scripts.train_cross_attention_rtx5000 \
     --feature-dir data/processed/all_features.parquet \
-    --epochs 50 \
-    --batch-size 64 \
-    --num-workers 4 \
+    --epochs 100 \
+    --batch-size 128 \
+    --num-workers 8 \
     --checkpoint-dir checkpoints_cross \
     --resume-from-last
