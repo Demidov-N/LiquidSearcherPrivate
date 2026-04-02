@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["superpowers@git+https://github.com/obra/superpowers.git", "opencode-claude-bridge"],
+  "agent": {
+    "memory": {
+      "base_directory": ".opencode/memory"
+    }
+  }
+}
+

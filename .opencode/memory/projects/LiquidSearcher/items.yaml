@@ -1,0 +1,79 @@
+# LiquidSearcher Project Facts
+
+- model: DualEncoder
+  architecture: temporal_encoder + tabular_encoder
+  temporal_input_dim: 13
+  tabular_continuous_dim: 15
+  embedding_dim: 128
+  joint_embedding_dim: 256
+  loss: InfoNCE
+  temperature: 0.07
+  checkpoint: checkpoints/last.ckpt
+  checkpoint_epoch: 58
+  status: trained
+
+- evaluation: Block1_UMAP
+  status: complete
+  key_finding: embeddings_dont_cluster_by_sector_globally
+  silhouette_score: -0.07
+  local_homogeneity: 22.6%
+  output_dir: results/figures/umap/
+
+- evaluation: Block2_SHAP
+  status: complete
+  implementation_date: 2026-03-31
+  explainer: KernelExplainer
+  reason: DeepExplainer_requires_TensorFlow
+  key_finding: beta_most_important_feature
+  top_features:
+    - feature: beta
+      mean_abs_shap: 0.4952
+    - feature: market_cap  
+      mean_abs_shap: 0.0396
+    - feature: idiosyncratic_vol
+      mean_abs_shap: 0.0240
+  mean_residual: 0.81
+  output_dir: results/shap_test2/
+
+- implementation: SHAP_analyzer
+  similarity_computation: tabular_embeddings_only
+  reason: dimension_consistency (128-dim)
+  background_sampling: k-means
+  candidate_selection: top_50_by_similarity
+  validated: true
+  performance: 7_seconds_per_candidate
+
+- data: all_features
+  path: data/processed/all_features.parquet
+  rows: 12M
+  symbols: 5971
+  date_range: 2010-2024
+  status: available
+
+- bug_fix: 2026-03-31
+  issue: dimension_mismatch
+  cause: query_emb_256_dim_vs_candidate_emb_128_dim
+  fix: compare_tabular_embeddings_only
+  file: src/evaluation/feature_importance/shap_analyzer.py
+  line: 167
+
+- bug_fix: 2026-03-31
+  issue: tensorflow_dependency
+  cause: DeepExplainer_requires_tensorflow
+  fix: use_KernelExplainer_instead
+  file: src/evaluation/feature_importance/shap_analyzer.py
+  line: 275
+
+- command: run_shap
+  type: evaluation
+  script: scripts/evaluation/run_shap_analysis.py
+  usage: uv run python -m scripts.evaluation.run_shap_analysis --n-queries 50 --n-candidates 50
+  dependencies: [shap,matplotlib,seaborn]
+
+- evaluation: Block4_retrieval
+  status: methodology_under_revision
+  issue: current_ground_truth_orders_by_liquidity_similarity_or_level
+  problem: this_does_not_match_desired_objective
+  desired_objective: retrieve_behaviorally_similar_stocks_then_prefer_more_liquid_candidates
+  implication: embedding_should_be_liquidity_agnostic_in_stage1
+  next_action: write_revised_scoring_spec_for_similarity_plus_liquidity_improvement
